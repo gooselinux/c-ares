@@ -1,0 +1,87 @@
+diff -up c-ares-1.7.0/configure.optflags c-ares-1.7.0/configure
+--- c-ares-1.7.0/configure.optflags	2009-11-30 16:10:42.000000000 -0500
++++ c-ares-1.7.0/configure	2009-12-01 11:36:41.154374899 -0500
+@@ -13988,7 +13988,7 @@ $as_echo "$as_me: WARNING: compiler opti
+     ac_var_stripped=""
+   for word1 in $tmp_CFLAGS; do
+     ac_var_strip_word="no"
+-    for word2 in $flags_dbg_all; do
++    for word2 in ""; do
+       if test "$word1" = "$word2"; then
+         ac_var_strip_word="yes"
+       fi
+@@ -14004,7 +14004,7 @@ $as_echo "$as_me: WARNING: compiler opti
+     ac_var_stripped=""
+   for word1 in $tmp_CPPFLAGS; do
+     ac_var_strip_word="no"
+-    for word2 in $flags_dbg_all; do
++    for word2 in ""; do
+       if test "$word1" = "$word2"; then
+         ac_var_strip_word="yes"
+       fi
+@@ -14020,12 +14020,12 @@ $as_echo "$as_me: WARNING: compiler opti
+     if test "$want_debug" = "yes"; then
+       { $as_echo "$as_me:${as_lineno-$LINENO}: checking if compiler accepts debug enabling options" >&5
+ $as_echo_n "checking if compiler accepts debug enabling options... " >&6; }
+-      tmp_options="$flags_dbg_yes"
++      tmp_options=""
+     fi
+     if test "$want_debug" = "no"; then
+       { $as_echo "$as_me:${as_lineno-$LINENO}: checking if compiler accepts debug disabling options" >&5
+ $as_echo_n "checking if compiler accepts debug disabling options... " >&6; }
+-      tmp_options="$flags_dbg_off"
++      tmp_options=""
+     fi
+     #
+     CPPFLAGS="$tmp_CPPFLAGS"
+@@ -14181,7 +14181,7 @@ $as_echo_n "checking if compiler optimiz
+ 
+   ac_var_match_word="no"
+   for word1 in $tmp_CFLAGS; do
+-    for word2 in $flags_opt_all; do
++    for word2 in ""; do
+       if test "$word1" = "$word2"; then
+         ac_var_match_word="yes"
+       fi
+@@ -14199,7 +14199,7 @@ $as_echo_n "checking if compiler optimiz
+ 
+   ac_var_match_word="no"
+   for word1 in $tmp_CPPFLAGS; do
+-    for word2 in $flags_opt_all; do
++    for word2 in ""; do
+       if test "$word1" = "$word2"; then
+         ac_var_match_word="yes"
+       fi
+@@ -14230,7 +14230,7 @@ $as_echo "$honor_optimize_option" >&6; }
+     ac_var_stripped=""
+   for word1 in $tmp_CFLAGS; do
+     ac_var_strip_word="no"
+-    for word2 in $flags_opt_all; do
++    for word2 in ""; do
+       if test "$word1" = "$word2"; then
+         ac_var_strip_word="yes"
+       fi
+@@ -14246,7 +14246,7 @@ $as_echo "$honor_optimize_option" >&6; }
+     ac_var_stripped=""
+   for word1 in $tmp_CPPFLAGS; do
+     ac_var_strip_word="no"
+-    for word2 in $flags_opt_all; do
++    for word2 in ""; do
+       if test "$word1" = "$word2"; then
+         ac_var_strip_word="yes"
+       fi
+@@ -14261,12 +14261,12 @@ $as_echo "$honor_optimize_option" >&6; }
+       if test "$want_optimize" = "yes"; then
+         { $as_echo "$as_me:${as_lineno-$LINENO}: checking if compiler accepts optimizer enabling options" >&5
+ $as_echo_n "checking if compiler accepts optimizer enabling options... " >&6; }
+-        tmp_options="$flags_opt_yes"
++        tmp_options=""
+       fi
+       if test "$want_optimize" = "no"; then
+         { $as_echo "$as_me:${as_lineno-$LINENO}: checking if compiler accepts optimizer disabling options" >&5
+ $as_echo_n "checking if compiler accepts optimizer disabling options... " >&6; }
+-        tmp_options="$flags_opt_off"
++        tmp_options=""
+       fi
+       CPPFLAGS="$tmp_CPPFLAGS"
+       CFLAGS="$tmp_CFLAGS $tmp_options"

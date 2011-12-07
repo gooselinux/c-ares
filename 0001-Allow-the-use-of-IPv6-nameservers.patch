@@ -1,0 +1,1659 @@
+From a9794547f61ccca1cdf71949f3f7183387300a7a Mon Sep 17 00:00:00 2001
+From: Jakub Hrozek <jhrozek@redhat.com>
+Date: Sun, 7 Mar 2010 18:37:47 +0100
+Subject: [PATCH] IPv6 nameserver patch
+
+---
+ Makefile.inc            |    6 +
+ adig.c                  |  103 +++++++++++++---
+ ahost.c                 |    4 +-
+ ares.h                  |   19 +++-
+ ares__get_hostent.c     |   12 +-
+ ares_data.c             |   13 ++
+ ares_data.h             |    6 +-
+ ares_destroy.c          |   35 ++++--
+ ares_free_data.3        |   14 ++-
+ ares_gethostbyaddr.c    |   20 ++--
+ ares_gethostbyname.c    |   24 ++--
+ ares_getnameinfo.c      |   14 ++-
+ ares_init.3             |   18 ++-
+ ares_init.c             |  307 +++++++++++++++++++++++++++++++++++------------
+ ares_ipv6.h             |   21 +---
+ ares_parse_aaaa_reply.c |   18 ++--
+ ares_private.h          |   22 ++--
+ ares_process.c          |  125 ++++++++++++++++---
+ ares_save_options.3     |   13 ++-
+ inet_net_pton.c         |    5 +-
+ inet_ntop.c             |    3 +-
+ vc/cares/vc6cares.dsp   |    4 +
+ 22 files changed, 590 insertions(+), 216 deletions(-)
+
+diff --git a/Makefile.inc b/Makefile.inc
+index 3227858..365de6c 100644
+--- a/Makefile.inc
++++ b/Makefile.inc
+@@ -70,6 +70,7 @@ MANPAGES = ares_cancel.3		\
+   ares_free_data.3			\
+   ares_free_hostent.3			\
+   ares_free_string.3			\
++  ares_get_servers.3			\
+   ares_gethostbyaddr.3			\
+   ares_gethostbyname.3			\
+   ares_gethostbyname_file.3		\
+@@ -91,6 +92,7 @@ MANPAGES = ares_cancel.3		\
+   ares_save_options.3			\
+   ares_search.3				\
+   ares_send.3				\
++  ares_set_servers.3			\
+   ares_set_socket_callback.3		\
+   ares_strerror.3			\
+   ares_timeout.3			\
+@@ -106,6 +108,7 @@ HTMLPAGES = ares_cancel.html		\
+   ares_free_data.html			\
+   ares_free_hostent.html		\
+   ares_free_string.html			\
++  ares_get_servers.html			\
+   ares_gethostbyaddr.html		\
+   ares_gethostbyname.html		\
+   ares_gethostbyname_file.html		\
+@@ -127,6 +130,7 @@ HTMLPAGES = ares_cancel.html		\
+   ares_save_options.html		\
+   ares_search.html			\
+   ares_send.html			\
++  ares_set_servers.html			\
+   ares_set_socket_callback.html		\
+   ares_strerror.html			\
+   ares_timeout.html			\
+@@ -142,6 +146,7 @@ PDFPAGES = ares_cancel.pdf		\
+   ares_free_data.pdf			\
+   ares_free_hostent.pdf			\
+   ares_free_string.pdf			\
++  ares_get_servers.pdf			\
+   ares_gethostbyaddr.pdf		\
+   ares_gethostbyname.pdf		\
+   ares_gethostbyname_file.pdf		\
+@@ -163,6 +168,7 @@ PDFPAGES = ares_cancel.pdf		\
+   ares_save_options.pdf			\
+   ares_search.pdf			\
+   ares_send.pdf				\
++  ares_set_servers.pdf			\
+   ares_set_socket_callback.pdf		\
+   ares_strerror.pdf			\
+   ares_timeout.pdf			\
+diff --git a/adig.c b/adig.c
+index 8897448..d827e0e 100644
+--- a/adig.c
++++ b/adig.c
+@@ -1,6 +1,6 @@
+ /* Copyright 1998 by the Massachusetts Institute of Technology.
+  *
+- * $Id: adig.c,v 1.43 2009-11-16 20:02:12 yangtse Exp $
++ * $Id: adig.c,v 1.44 2010-03-05 20:01:47 yangtse Exp $
+  *
+  * Permission to use, copy, modify, and distribute this
+  * software and its documentation for any purpose and without
+@@ -164,8 +164,6 @@ static const char *rcodes[] = {
+   "(unknown)", "(unknown)", "(unknown)", "(unknown)", "NOCHANGE"
+ };
+ 
+-static struct in_addr inaddr;
+-
+ static void callback(void *arg, int status, int timeouts,
+                      unsigned char *abuf, int alen);
+ static const unsigned char *display_question(const unsigned char *aptr,
+@@ -176,6 +174,9 @@ static const unsigned char *display_rr(const unsigned char *aptr,
+ static const char *type_name(int type);
+ static const char *class_name(int dnsclass);
+ static void usage(void);
++static void destroy_addr_list(struct ares_addr_node *head);
++static void append_addr_list(struct ares_addr_node **head,
++                             struct ares_addr_node *node);
+ 
+ int main(int argc, char **argv)
+ {
+@@ -186,6 +187,7 @@ int main(int argc, char **argv)
+   struct hostent *hostent;
+   fd_set read_fds, write_fds;
+   struct timeval *tvp, tv;
++  struct ares_addr_node *srvr, *servers = NULL;
+ 
+ #ifdef USE_WINSOCK
+   WORD wVersionRequested = MAKEWORD(USE_WINSOCK,USE_WINSOCK);
+@@ -227,27 +229,56 @@ int main(int argc, char **argv)
+           break;
+ 
+         case 's':
+-          /* Add a server, and specify servers in the option mask. */
+-          if (ares_inet_pton(AF_INET, optarg, &inaddr) <= 0)
++          /* User specified name servers override default ones. */
++          srvr = malloc(sizeof(struct ares_addr_node));
++          if (!srvr)
++            {
++              fprintf(stderr, "Out of memory!\n");
++              destroy_addr_list(servers);
++              return 1;
++            }
++          append_addr_list(&servers, srvr);
++          if (ares_inet_pton(AF_INET, optarg, &srvr->addr.addr4) > 0)
++            srvr->family = AF_INET;
++          else if (ares_inet_pton(AF_INET6, optarg, &srvr->addr.addr6) > 0)
++            srvr->family = AF_INET6;
++          else
+             {
+               hostent = gethostbyname(optarg);
+-              if (!hostent || hostent->h_addrtype != AF_INET)
++              if (!hostent)
+                 {
+                   fprintf(stderr, "adig: server %s not found.\n", optarg);
++                  destroy_addr_list(servers);
+                   return 1;
+                 }
+-              memcpy(&inaddr, hostent->h_addr, sizeof(struct in_addr));
+-            }
+-          options.servers = realloc(options.servers, (options.nservers + 1)
+-                                    * sizeof(struct in_addr));
+-          if (!options.servers)
+-            {
+-              fprintf(stderr, "Out of memory!\n");
+-              return 1;
++              switch (hostent->h_addrtype)
++                {
++                  case AF_INET:
++                    srvr->family = AF_INET;
++                    memcpy(&srvr->addr.addr4, hostent->h_addr,
++                           sizeof(srvr->addr.addr4));
++                    break;
++                  case AF_INET6:
++                    srvr->family = AF_INET6;
++                    memcpy(&srvr->addr.addr6, hostent->h_addr,
++                           sizeof(srvr->addr.addr6));
++                    break;
++                  default:
++                    fprintf(stderr,
++                      "adig: server %s unsupported address family.\n", optarg);
++                    destroy_addr_list(servers);
++                    return 1;
++                }
+             }
+-          memcpy(&options.servers[options.nservers], &inaddr,
+-                 sizeof(struct in_addr));
+-          options.nservers++;
++          /* Notice that calling ares_init_options() without servers in the
++           * options struct and with ARES_OPT_SERVERS set simultaneously in
++           * the options mask, results in an initialization with no servers.
++           * When alternative name servers have been specified these are set
++           * later calling ares_set_servers() overriding any existing server
++           * configuration. To prevent initial configuration with default
++           * servers that will be discarded later ARES_OPT_SERVERS is set.
++           * If this flag is not set here the result shall be the same but
++           * ares_init_options() will do needless work. */
+           optmask |= ARES_OPT_SERVERS;
+           break;
+ 
+@@ -308,6 +339,18 @@ int main(int argc, char **argv)
+       return 1;
+     }
+ 
++  if(servers)
++    {
++      status = ares_set_servers(channel, servers);
++      destroy_addr_list(servers);
++      if (status != ARES_SUCCESS)
++        {
++          fprintf(stderr, "ares_init_options: %s\n",
++                  ares_strerror(status));
++          return 1;
++        }
++    }
++
+   /* Initiate the queries, one per command-line argument.  If there is
+    * only one query to do, supply NULL as the callback argument;
+    * otherwise, supply the query name as an argument so we can
+@@ -749,3 +792,29 @@ static void usage(void)
+           "[-t type] [-p port] name ...\n");
+   exit(1);
+ }
++
++static void destroy_addr_list(struct ares_addr_node *head)
++{
++  while(head)
++    {
++      struct ares_addr_node *detached = head;
++      head = head->next;
++      free(detached);
++    }
++}
++
++static void append_addr_list(struct ares_addr_node **head,
++                             struct ares_addr_node *node)
++{
++  struct ares_addr_node *last;
++  node->next = NULL;
++  if(*head)
++    {
++      last = *head;
++      while(last->next)
++        last = last->next;
++      last->next = node;
++    }
++  else
++    *head = node;
++}
+diff --git a/ahost.c b/ahost.c
+index ebfa97f..5256186 100644
+--- a/ahost.c
++++ b/ahost.c
+@@ -1,6 +1,6 @@
+ /* Copyright 1998 by the Massachusetts Institute of Technology.
+  *
+- * $Id: ahost.c,v 1.28 2009-11-10 18:41:03 yangtse Exp $
++ * $Id: ahost.c,v 1.29 2010-03-05 20:01:47 yangtse Exp $
+  *
+  * Permission to use, copy, modify, and distribute this
+  * software and its documentation for any purpose and without
+@@ -69,7 +69,7 @@ int main(int argc, char **argv)
+   fd_set read_fds, write_fds;
+   struct timeval *tvp, tv;
+   struct in_addr addr4;
+-  struct in6_addr addr6;
++  struct ares_in6_addr addr6;
+ 
+ #ifdef USE_WINSOCK
+   WORD wVersionRequested = MAKEWORD(USE_WINSOCK,USE_WINSOCK);
+diff --git a/ares.h b/ares.h
+index b1c2c22..fc333e5 100644
+--- a/ares.h
++++ b/ares.h
+@@ -1,7 +1,7 @@
+-/* $Id: ares.h,v 1.72 2009-11-23 12:03:32 yangtse Exp $ */
++/* $Id: ares.h,v 1.73 2010-03-05 20:01:47 yangtse Exp $ */
+ 
+ /* Copyright 1998, 2009 by the Massachusetts Institute of Technology.
+- * Copyright (C) 2007-2009 by Daniel Stenberg
++ * Copyright (C) 2007-2010 by Daniel Stenberg
+  *
+  * Permission to use, copy, modify, and distribute this
+  * software and its documentation for any purpose and without
+@@ -487,6 +487,21 @@ CARES_EXTERN void ares_free_data(void *dataptr);
+ 
+ CARES_EXTERN const char *ares_strerror(int code);
+ 
++struct ares_addr_node {
++  struct ares_addr_node *next;
++  int family;
++  union {
++    struct in_addr       addr4;
++    struct ares_in6_addr addr6;
++  } addr;
++};
++
++CARES_EXTERN int ares_set_servers(ares_channel channel,
++                                  struct ares_addr_node *servers);
++
++CARES_EXTERN int ares_get_servers(ares_channel channel,
++                                  struct ares_addr_node **servers);
++
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/ares__get_hostent.c b/ares__get_hostent.c
+index 335f763..5d4956b 100644
+--- a/ares__get_hostent.c
++++ b/ares__get_hostent.c
+@@ -1,6 +1,6 @@
+-/* $Id: ares__get_hostent.c,v 1.24 2009-11-02 11:55:53 yangtse Exp $ */
++/* $Id: ares__get_hostent.c,v 1.25 2010-03-05 20:01:47 yangtse Exp $ */
+ 
+-/* Copyright 1998, 2009 by the Massachusetts Institute of Technology.
++/* Copyright 1998, 2010 by the Massachusetts Institute of Technology.
+  *
+  * Permission to use, copy, modify, and distribute this
+  * software and its documentation for any purpose and without
+@@ -146,7 +146,7 @@ int ares__get_hostent(FILE *fp, int family, struct hostent **host)
+             {
+               /* Actual network address family and length. */
+               addr.family = AF_INET;
+-              addrlen = sizeof(struct in_addr);
++              addrlen = sizeof(addr.addrV4);
+             }
+         }
+       if ((family == AF_INET6) || ((family == AF_UNSPEC) && (!addrlen)))
+@@ -155,7 +155,7 @@ int ares__get_hostent(FILE *fp, int family, struct hostent **host)
+             {
+               /* Actual network address family and length. */
+               addr.family = AF_INET6;
+-              addrlen = sizeof(struct in6_addr);
++              addrlen = sizeof(addr.addrV6);
+             }
+         }
+       if (!addrlen)
+@@ -189,9 +189,9 @@ int ares__get_hostent(FILE *fp, int family, struct hostent **host)
+       if (!hostent->h_addr_list[0])
+         break;
+       if (addr.family == AF_INET)
+-        memcpy(hostent->h_addr_list[0], &addr.addrV4, sizeof(struct in_addr));
++        memcpy(hostent->h_addr_list[0], &addr.addrV4, sizeof(addr.addrV4));
+       else
+-        memcpy(hostent->h_addr_list[0], &addr.addrV6, sizeof(struct in6_addr));
++        memcpy(hostent->h_addr_list[0], &addr.addrV6, sizeof(addr.addrV6));
+ 
+       /* Copy aliases. */
+       hostent->h_aliases = malloc((naliases + 1) * sizeof(char *));
+diff --git a/ares_data.c b/ares_data.c
+index 1ad66a6..06d61c5 100644
+--- a/ares_data.c
++++ b/ares_data.c
+@@ -34,6 +34,7 @@
+ ** of c-ares functions returning pointers that must be free'ed using this
+ ** function is:
+ **
++**   ares_get_servers()
+ **   ares_parse_srv_reply()
+ **   ares_parse_txt_reply()
+ */
+@@ -68,6 +69,12 @@ void ares_free_data(void *dataptr)
+           free(ptr->data.txt_reply.txt);
+         break;
+ 
++      case ARES_DATATYPE_ADDR_NODE:
++
++        if (ptr->data.addr_node.next)
++          ares_free_data(ptr->data.addr_node.next);
++        break;
++
+       default:
+         return;
+     }
+@@ -111,6 +118,12 @@ void *ares_malloc_data(ares_datatype type)
+         ptr->data.txt_reply.length  = 0;
+         break;
+ 
++      case ARES_DATATYPE_ADDR_NODE:
++        ptr->data.addr_node.next = NULL;
++        ptr->data.addr_node.family = 0;
++        memset(&ptr->data.addr_node.addrV6, 0,
++          sizeof(ptr->data.addr_node.addrV6));
++
+       default:
+         free(ptr);
+         return NULL;
+diff --git a/ares_data.h b/ares_data.h
+index 18794e3..4ed626b 100644
+--- a/ares_data.h
++++ b/ares_data.h
+@@ -1,6 +1,6 @@
+-/* $Id: ares_data.h,v 1.2 2009-11-23 12:03:33 yangtse Exp $ */
++/* $Id: ares_data.h,v 1.3 2010-03-05 20:01:47 yangtse Exp $ */
+ 
+-/* Copyright (C) 2009 by Daniel Stenberg
++/* Copyright (C) 2009-2010 by Daniel Stenberg
+  *
+  * Permission to use, copy, modify, and distribute this
+  * software and its documentation for any purpose and without
+@@ -19,6 +19,7 @@ typedef enum {
+   ARES_DATATYPE_UNKNOWN = 1,  /* unknown data type     - introduced in 1.7.0 */
+   ARES_DATATYPE_SRV_REPLY,    /* struct ares_srv_reply - introduced in 1.7.0 */
+   ARES_DATATYPE_TXT_REPLY,    /* struct ares_txt_reply - introduced in 1.7.0 */
++  ARES_DATATYPE_ADDR_NODE,    /* struct ares_addr_node - introduced in 1.7.1 */
+ #if 0
+   ARES_DATATYPE_ADDR6TTL,     /* struct ares_addrttl   */
+   ARES_DATATYPE_ADDRTTL,      /* struct ares_addr6ttl  */
+@@ -54,6 +55,7 @@ struct ares_data {
+   union {
+     struct ares_txt_reply txt_reply;
+     struct ares_srv_reply srv_reply;
++    struct ares_addr_node addr_node;
+   } data;
+ };
+ 
+diff --git a/ares_destroy.c b/ares_destroy.c
+index 0044a71..1fa0196 100644
+--- a/ares_destroy.c
++++ b/ares_destroy.c
+@@ -1,6 +1,7 @@
+-/* $Id: ares_destroy.c,v 1.14 2009-11-02 11:55:53 yangtse Exp $ */
++/* $Id: ares_destroy.c,v 1.15 2010-03-05 20:01:48 yangtse Exp $ */
+ 
+ /* Copyright 1998 by the Massachusetts Institute of Technology.
++ * Copyright (C) 2004-2010 by Daniel Stenberg
+  *
+  * Permission to use, copy, modify, and distribute this
+  * software and its documentation for any purpose and without
+@@ -25,7 +26,8 @@ void ares_destroy_options(struct ares_options *options)
+ {
+   int i;
+ 
+-  free(options->servers);
++  if(options->servers)
++    free(options->servers);
+   for (i = 0; i < options->ndomains; i++)
+     free(options->domains[i]);
+   free(options->domains);
+@@ -67,15 +69,7 @@ void ares_destroy(ares_channel channel)
+     }
+ #endif
+ 
+-  if (channel->servers) {
+-    for (i = 0; i < channel->nservers; i++)
+-      {
+-        struct server_state *server = &channel->servers[i];
+-        ares__close_sockets(channel, server);
+-        assert(ares__is_list_empty(&(server->queries_to_server)));
+-      }
+-    free(channel->servers);
+-  }
++  ares__destroy_servers_state(channel);
+ 
+   if (channel->domains) {
+     for (i = 0; i < channel->ndomains; i++)
+@@ -91,3 +85,22 @@ void ares_destroy(ares_channel channel)
+ 
+   free(channel);
+ }
++
++void ares__destroy_servers_state(ares_channel channel)
++{
++  struct server_state *server;
++  int i;
++
++  if (channel->servers)
++    {
++      for (i = 0; i < channel->nservers; i++)
++        {
++          server = &channel->servers[i];
++          ares__close_sockets(channel, server);
++          assert(ares__is_list_empty(&server->queries_to_server));
++        }
++      free(channel->servers);
++      channel->servers = NULL;
++    }
++  channel->nservers = -1;
++}
+diff --git a/ares_free_data.3 b/ares_free_data.3
+index f0655c6..633f0b1 100644
+--- a/ares_free_data.3
++++ b/ares_free_data.3
+@@ -1,7 +1,7 @@
+-.\" $Id: ares_free_data.3,v 1.3 2009-11-23 12:03:33 yangtse Exp $
++.\" $Id: ares_free_data.3,v 1.4 2010-03-05 20:01:48 yangtse Exp $
+ .\"
+ .\" Copyright 1998 by the Massachusetts Institute of Technology.
+-.\" Copyright (C) 2004-2009 by Daniel Stenberg
++.\" Copyright (C) 2004-2010 by Daniel Stenberg
+ .\"
+ .\" Permission to use, copy, modify, and distribute this
+ .\" software and its documentation for any purpose and without
+@@ -15,7 +15,7 @@
+ .\" this software for any purpose.  It is provided "as is"
+ .\" without express or implied warranty.
+ .\"
+-.TH ARES_FREE_DATA 3 "23 Nov 2009"
++.TH ARES_FREE_DATA 3 "5 March 2010"
+ .SH NAME
+ ares_free_data \- Free data allocated by several c-ares functions
+ .SH SYNOPSIS
+@@ -34,6 +34,11 @@ function frees one or more data structures allocated and returned
+ by several c-ares functions. Specifically the data returned by the
+ following list of functions must be deallocated using this function.
+ .TP 5
++.B ares_get_servers(3)
++When used to free the data returned by ares_get_servers(3) this
++will free the whole linked list of ares_addr_node structures returned
++by ares_get_servers(3).
++.TP
+ .B ares_parse_srv_reply(3)
+ When used to free the data returned by ares_parse_srv_reply(3) this
+ will free the whole linked list of ares_srv_reply structures returned
+@@ -50,6 +55,7 @@ The ares_free_data() function does not return a value.
+ .SH AVAILABILITY
+ This function was first introduced in c-ares version 1.7.0.
+ .SH SEE ALSO
++.BR ares_get_servers(3),
+ .BR ares_parse_srv_reply(3),
+ .BR ares_parse_txt_reply(3)
+ .SH AUTHOR
+@@ -57,4 +63,4 @@ Yang Tse
+ .PP
+ Copyright 1998 by the Massachusetts Institute of Technology.
+ .br
+-Copyright (C) 2004-2009 by Daniel Stenberg.
++Copyright (C) 2004-2010 by Daniel Stenberg.
+diff --git a/ares_gethostbyaddr.c b/ares_gethostbyaddr.c
+index 732a031..25dc8cb 100644
+--- a/ares_gethostbyaddr.c
++++ b/ares_gethostbyaddr.c
+@@ -1,4 +1,4 @@
+-/* $Id: ares_gethostbyaddr.c,v 1.35 2009-11-02 11:55:53 yangtse Exp $ */
++/* $Id: ares_gethostbyaddr.c,v 1.37 2010-03-06 01:23:09 yangtse Exp $ */
+ 
+ /* Copyright 1998 by the Massachusetts Institute of Technology.
+  *
+@@ -79,8 +79,8 @@ void ares_gethostbyaddr(ares_channel channel, const void *addr, int addrlen,
+       return;
+     }
+ 
+-  if ((family == AF_INET && addrlen != sizeof(struct in_addr)) ||
+-      (family == AF_INET6 && addrlen != sizeof(struct in6_addr)))
++  if ((family == AF_INET && addrlen != sizeof(aquery->addr.addrV4)) ||
++      (family == AF_INET6 && addrlen != sizeof(aquery->addr.addrV6)))
+     {
+       callback(arg, ARES_ENOTIMP, 0, NULL);
+       return;
+@@ -94,9 +94,9 @@ void ares_gethostbyaddr(ares_channel channel, const void *addr, int addrlen,
+     }
+   aquery->channel = channel;
+   if (family == AF_INET)
+-    memcpy(&aquery->addr.addrV4, addr, sizeof(struct in_addr));
++    memcpy(&aquery->addr.addrV4, addr, sizeof(aquery->addr.addrV4));
+   else
+-    memcpy(&aquery->addr.addrV6, addr, sizeof(struct in6_addr));
++    memcpy(&aquery->addr.addrV6, addr, sizeof(aquery->addr.addrV6));
+   aquery->addr.family = family;
+   aquery->callback = callback;
+   aquery->arg = arg;
+@@ -152,13 +152,13 @@ static void addr_callback(void *arg, int status, int timeouts,
+     {
+       if (aquery->addr.family == AF_INET)
+         {
+-          addrlen = sizeof(struct in_addr);
++          addrlen = sizeof(aquery->addr.addrV4);
+           status = ares_parse_ptr_reply(abuf, alen, &aquery->addr.addrV4,
+                                         (int)addrlen, AF_INET, &host);
+         }
+       else
+         {
+-          addrlen = sizeof(struct in6_addr);
++          addrlen = sizeof(aquery->addr.addrV6);
+           status = ares_parse_ptr_reply(abuf, alen, &aquery->addr.addrV6,
+                                         (int)addrlen, AF_INET6, &host);
+         }
+@@ -241,12 +241,12 @@ static int file_lookup(struct ares_addr *addr, struct hostent **host)
+         }
+       if (addr->family == AF_INET)
+         {
+-          if (memcmp((*host)->h_addr, &addr->addrV4, sizeof(struct in_addr)) == 0)
++          if (memcmp((*host)->h_addr, &addr->addrV4, sizeof(addr->addrV4)) == 0)
+             break;
+         }
+       else if (addr->family == AF_INET6)
+         {
+-          if (memcmp((*host)->h_addr, &addr->addrV6, sizeof(struct in6_addr)) == 0)
++          if (memcmp((*host)->h_addr, &addr->addrV6, sizeof(addr->addrV6)) == 0)
+             break;
+         }
+       ares_free_hostent(*host);
+@@ -272,7 +272,7 @@ static void ptr_rr_name(char *name, const struct ares_addr *addr)
+     }
+   else
+     {
+-       unsigned char *bytes = (unsigned char *)&addr->addrV6.s6_addr;
++       unsigned char *bytes = (unsigned char *)&addr->addrV6;
+        /* There are too many arguments to do this in one line using
+         * minimally C89-compliant compilers */
+        sprintf(name,
+diff --git a/ares_gethostbyname.c b/ares_gethostbyname.c
+index fc66c6f..7d0f8c6 100644
+--- a/ares_gethostbyname.c
++++ b/ares_gethostbyname.c
+@@ -1,4 +1,4 @@
+-/* $Id: ares_gethostbyname.c,v 1.50 2009-11-02 11:55:53 yangtse Exp $ */
++/* $Id: ares_gethostbyname.c,v 1.52 2010-03-06 01:23:09 yangtse Exp $ */
+ 
+ /* Copyright 1998 by the Massachusetts Institute of Technology.
+  *
+@@ -81,7 +81,7 @@ static void sort6_addresses(struct hostent *host,
+                             const struct apattern *sortlist, int nsort);
+ static int get_address_index(const struct in_addr *addr,
+                              const struct apattern *sortlist, int nsort);
+-static int get6_address_index(const struct in6_addr *addr,
++static int get6_address_index(const struct ares_in6_addr *addr,
+                               const struct apattern *sortlist, int nsort);
+ 
+ void ares_gethostbyname(ares_channel channel, const char *name, int family,
+@@ -243,7 +243,7 @@ static int fake_hostent(const char *name, int family, ares_host_callback callbac
+   char *addrs[2];
+   int result = 0;
+   struct in_addr in;
+-  struct in6_addr in6;
++  struct ares_in6_addr in6;
+ 
+   if (family == AF_INET || family == AF_INET6)
+     {
+@@ -284,7 +284,7 @@ static int fake_hostent(const char *name, int family, ares_host_callback callbac
+     }
+   else if (family == AF_INET6)
+     {
+-      hostent.h_length = (int)sizeof(struct in6_addr);
++      hostent.h_length = (int)sizeof(struct ares_in6_addr);
+       addrs[0] = (char *)&in6;
+     }
+   /* Duplicate the name, to avoid a constness violation. */
+@@ -467,7 +467,7 @@ static int get_address_index(const struct in_addr *addr,
+ static void sort6_addresses(struct hostent *host, const struct apattern *sortlist,
+                            int nsort)
+ {
+-  struct in6_addr a1, a2;
++  struct ares_in6_addr a1, a2;
+   int i1, i2, ind1, ind2;
+ 
+   /* This is a simple insertion sort, not optimized at all.  i1 walks
+@@ -477,24 +477,24 @@ static void sort6_addresses(struct hostent *host, const struct apattern *sortlis
+    */
+   for (i1 = 0; host->h_addr_list[i1]; i1++)
+     {
+-      memcpy(&a1, host->h_addr_list[i1], sizeof(struct in6_addr));
++      memcpy(&a1, host->h_addr_list[i1], sizeof(struct ares_in6_addr));
+       ind1 = get6_address_index(&a1, sortlist, nsort);
+       for (i2 = i1 - 1; i2 >= 0; i2--)
+         {
+-          memcpy(&a2, host->h_addr_list[i2], sizeof(struct in6_addr));
++          memcpy(&a2, host->h_addr_list[i2], sizeof(struct ares_in6_addr));
+           ind2 = get6_address_index(&a2, sortlist, nsort);
+           if (ind2 <= ind1)
+             break;
+-          memcpy(host->h_addr_list[i2 + 1], &a2, sizeof(struct in6_addr));
++          memcpy(host->h_addr_list[i2 + 1], &a2, sizeof(struct ares_in6_addr));
+         }
+-      memcpy(host->h_addr_list[i2 + 1], &a1, sizeof(struct in6_addr));
++      memcpy(host->h_addr_list[i2 + 1], &a1, sizeof(struct ares_in6_addr));
+     }
+ }
+ 
+ /* Find the first entry in sortlist which matches addr.  Return nsort
+  * if none of them match.
+  */
+-static int get6_address_index(const struct in6_addr *addr,
++static int get6_address_index(const struct ares_in6_addr *addr,
+                               const struct apattern *sortlist,
+                               int nsort)
+ {
+@@ -504,7 +504,9 @@ static int get6_address_index(const struct in6_addr *addr,
+     {
+       if (sortlist[i].family != AF_INET6)
+         continue;
+-        if (!ares_bitncmp(&addr->s6_addr, &sortlist[i].addrV6.s6_addr, sortlist[i].mask.bits))
++        if (!ares_bitncmp(addr,
++                          &sortlist[i].addrV6,
++                          sortlist[i].mask.bits))
+           break;
+     }
+   return i;
+diff --git a/ares_getnameinfo.c b/ares_getnameinfo.c
+index c1c0b16..94891ce 100644
+--- a/ares_getnameinfo.c
++++ b/ares_getnameinfo.c
+@@ -1,4 +1,4 @@
+-/* $Id: ares_getnameinfo.c,v 1.36 2009-11-09 12:56:11 yangtse Exp $ */
++/* $Id: ares_getnameinfo.c,v 1.37 2010-03-05 20:01:48 yangtse Exp $ */
+ 
+ /* Copyright 2005 by Dominick Meglio
+  *
+@@ -74,9 +74,11 @@ struct nameinfo_query {
+ };
+ 
+ #ifdef HAVE_SOCKADDR_IN6_SIN6_SCOPE_ID
+-#define IPBUFSIZ 40+IF_NAMESIZE
++#define IPBUFSIZ \
++        (sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255") + IF_NAMESIZE)
+ #else
+-#define IPBUFSIZ 40
++#define IPBUFSIZ \
++        (sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255"))
+ #endif
+ 
+ static void nameinfo_callback(void *arg, int status, int timeouts, struct hostent *host);
+@@ -184,14 +186,16 @@ void ares_getnameinfo(ares_channel channel, const struct sockaddr *sa,
+           {
+             niquery->family = AF_INET;
+             memcpy(&niquery->addr.addr4, addr, sizeof(addr));
+-            ares_gethostbyaddr(channel, &addr->sin_addr, sizeof(struct in_addr), AF_INET,
++            ares_gethostbyaddr(channel, &addr->sin_addr,
++                               sizeof(struct in_addr), AF_INET,
+                                nameinfo_callback, niquery);
+           }
+         else
+           {
+             niquery->family = AF_INET6;
+             memcpy(&niquery->addr.addr6, addr6, sizeof(addr6));
+-            ares_gethostbyaddr(channel, &addr6->sin6_addr, sizeof(struct in6_addr), AF_INET6,
++            ares_gethostbyaddr(channel, &addr6->sin6_addr,
++                               sizeof(struct ares_in6_addr), AF_INET6,
+                                nameinfo_callback, niquery);
+           }
+       }
+diff --git a/ares_init.3 b/ares_init.3
+index 14be75f..d974090 100644
+--- a/ares_init.3
++++ b/ares_init.3
+@@ -1,7 +1,7 @@
+-.\" $Id: ares_init.3,v 1.8 2009-11-23 00:57:51 yangtse Exp $
++.\" $Id: ares_init.3,v 1.9 2010-03-05 20:01:48 yangtse Exp $
+ .\"
+ .\" Copyright 1998 by the Massachusetts Institute of Technology.
+-.\" Copyright (C) 2004-2009 by Daniel Stenberg
++.\" Copyright (C) 2004-2010 by Daniel Stenberg
+ .\"
+ .\" Permission to use, copy, modify, and distribute this
+ .\" software and its documentation for any purpose and without
+@@ -15,7 +15,7 @@
+ .\" this software for any purpose.  It is provided "as is"
+ .\" without express or implied warranty.
+ .\"
+-.TH ARES_INIT 3 "26 May 2009"
++.TH ARES_INIT 3 "5 March 2010"
+ .SH NAME
+ ares_init, ares_init_options \- Initialize a resolver channel
+ .SH SYNOPSIS
+@@ -93,8 +93,11 @@ service port.
+ .br
+ .B int \fInservers\fP;
+ .br
+-The list of servers to contact, instead of the servers specified in
+-resolv.conf or the local named.
++The list of IPv4 servers to contact, instead of the servers specified in
++resolv.conf or the local named. In order to allow specification of either
++IPv4 or IPv6 name servers, function
++.BR ares_set_servers(3)
++must be used instead.
+ .TP 18
+ .B ARES_OPT_DOMAINS
+ .B char **\fIdomains\fP;
+@@ -190,10 +193,11 @@ c-ares library initialization not yet performed.
+ .SH SEE ALSO
+ .BR ares_destroy(3),
+ .BR ares_dup(3),
+-.BR ares_library_init(3)
++.BR ares_library_init(3),
++.BR ares_set_servers(3)
+ .SH AUTHOR
+ Greg Hudson, MIT Information Systems
+ .br
+ Copyright 1998 by the Massachusetts Institute of Technology.
+ .br
+-Copyright (C) 2004-2009 by Daniel Stenberg.
++Copyright (C) 2004-2010 by Daniel Stenberg.
+diff --git a/ares_init.c b/ares_init.c
+index cb541af..cdcf38a 100644
+--- a/ares_init.c
++++ b/ares_init.c
+@@ -1,7 +1,7 @@
+-/* $Id: ares_init.c,v 1.103 2009-11-18 10:33:54 yangtse Exp $ */
++/* $Id: ares_init.c,v 1.104 2010-03-05 20:01:48 yangtse Exp $ */
+ 
+ /* Copyright 1998 by the Massachusetts Institute of Technology.
+- * Copyright (C) 2007-2009 by Daniel Stenberg
++ * Copyright (C) 2007-2010 by Daniel Stenberg
+  *
+  * Permission to use, copy, modify, and distribute this
+  * software and its documentation for any purpose and without
+@@ -68,6 +68,7 @@
+ #include "ares.h"
+ #include "inet_net_pton.h"
+ #include "ares_library_init.h"
++#include "ares_data.h"
+ #include "ares_private.h"
+ 
+ #ifdef WATT32
+@@ -118,7 +119,6 @@ int ares_init_options(ares_channel *channelptr, struct ares_options *options,
+   ares_channel channel;
+   int i;
+   int status = ARES_SUCCESS;
+-  struct server_state *server;
+   struct timeval now;
+ 
+ #ifdef CURLDEBUG
+@@ -247,21 +247,7 @@ int ares_init_options(ares_channel *channelptr, struct ares_options *options,
+   if ((channel->flags & ARES_FLAG_PRIMARY) && channel->nservers > 1)
+     channel->nservers = 1;
+ 
+-  /* Initialize server states. */
+-  for (i = 0; i < channel->nservers; i++)
+-    {
+-      server = &channel->servers[i];
+-      server->udp_socket = ARES_SOCKET_BAD;
+-      server->tcp_socket = ARES_SOCKET_BAD;
+-      server->tcp_connection_generation = ++channel->tcp_connection_generation;
+-      server->tcp_lenbuf_pos = 0;
+-      server->tcp_buffer = NULL;
+-      server->qhead = NULL;
+-      server->qtail = NULL;
+-      ares__init_list_head(&(server->queries_to_server));
+-      server->channel = channel;
+-      server->is_broken = 0;
+-    }
++  ares__init_servers_state(channel);
+ 
+   *channelptr = channel;
+   return ARES_SUCCESS;
+@@ -272,7 +258,9 @@ int ares_init_options(ares_channel *channelptr, struct ares_options *options,
+ int ares_dup(ares_channel *dest, ares_channel src)
+ {
+   struct ares_options opts;
+-  int rc;
++  struct ares_addr_node *servers;
++  int ipv6_nservers = 0;
++  int i, rc;
+   int optmask;
+ 
+   *dest = NULL; /* in case of failure return NULL explicitly */
+@@ -296,16 +284,33 @@ int ares_dup(ares_channel *dest, ares_channel src)
+   (*dest)->sock_create_cb      = src->sock_create_cb;
+   (*dest)->sock_create_cb_data = src->sock_create_cb_data;
+ 
++  /* Full name server cloning required when not all are IPv4 */
++  for (i = 0; i < src->nservers; i++)
++    {
++      if (src->servers[i].addr.family != AF_INET) {
++        ipv6_nservers++;
++        break;
++      }
++    }
++  if (ipv6_nservers) {
++    rc = ares_get_servers(src, &servers);
++    if (rc != ARES_SUCCESS)
++      return rc;
++    rc = ares_set_servers(*dest, servers);
++    ares_free_data(servers);
++    if (rc != ARES_SUCCESS)
++      return rc;
++  }
+ 
+   return ARES_SUCCESS; /* everything went fine */
+-
+ }
+ 
+ /* Save options from initialized channel */
+ int ares_save_options(ares_channel channel, struct ares_options *options,
+                       int *optmask)
+ {
+-  int i;
++  int i, j;
++  int ipv4_nservers = 0;
+ 
+   /* Zero everything out */
+   memset(options, 0, sizeof(struct ares_options));
+@@ -335,16 +340,27 @@ int ares_save_options(ares_channel channel, struct ares_options *options,
+   options->sock_state_cb     = channel->sock_state_cb;
+   options->sock_state_cb_data = channel->sock_state_cb_data;
+ 
+-  /* Copy servers */
++  /* Copy IPv4 servers */
+   if (channel->nservers) {
+-    options->servers =
+-      malloc(channel->nservers * sizeof(struct server_state));
+-    if (!options->servers && channel->nservers != 0)
+-      return ARES_ENOMEM;
+     for (i = 0; i < channel->nservers; i++)
+-      options->servers[i] = channel->servers[i].addr;
++    {
++      if (channel->servers[i].addr.family == AF_INET)
++        ipv4_nservers++;
++    }
++    if (ipv4_nservers) {
++      options->servers = malloc(ipv4_nservers * sizeof(struct server_state));
++      if (!options->servers)
++        return ARES_ENOMEM;
++      for (i = j = 0; i < channel->nservers; i++)
++      {
++        if (channel->servers[i].addr.family == AF_INET)
++          memcpy(&options->servers[j++],
++                 &channel->servers[i].addr.addrV4,
++                 sizeof(channel->servers[i].addr.addrV4));
++      }
++    }
+   }
+-  options->nservers = channel->nservers;
++  options->nservers = ipv4_nservers;
+ 
+   /* copy domains */
+   if (channel->ndomains) {
+@@ -420,7 +436,7 @@ static int init_by_options(ares_channel channel,
+       && channel->socket_receive_buffer_size == -1)
+     channel->socket_receive_buffer_size = options->socket_receive_buffer_size;
+ 
+-  /* Copy the servers, if given. */
++  /* Copy the IPv4 servers, if given. */
+   if ((optmask & ARES_OPT_SERVERS) && channel->nservers == -1)
+     {
+       /* Avoid zero size allocations at any cost */
+@@ -431,7 +447,12 @@ static int init_by_options(ares_channel channel,
+           if (!channel->servers)
+             return ARES_ENOMEM;
+           for (i = 0; i < options->nservers; i++)
+-            channel->servers[i].addr = options->servers[i];
++            {
++              channel->servers[i].addr.family = AF_INET;
++              memcpy(&channel->servers[i].addr.addrV4,
++                     &options->servers[i],
++                     sizeof(channel->servers[i].addr.addrV4));
++            }
+         }
+       channel->nservers = options->nservers;
+     }
+@@ -1001,7 +1022,8 @@ static int init_by_defaults(ares_channel channel)
+       rc = ARES_ENOMEM;
+       goto error;
+     }
+-    channel->servers[0].addr.s_addr = htonl(INADDR_LOOPBACK);
++    channel->servers[0].addr.family = AF_INET;
++    channel->servers[0].addr.addrV4.s_addr = htonl(INADDR_LOOPBACK);
+     channel->nservers = 1;
+   }
+ 
+@@ -1149,61 +1171,62 @@ static int config_lookup(ares_channel channel, const char *str,
+ static int config_nameserver(struct server_state **servers, int *nservers,
+                              char *str)
+ {
+-  struct in_addr addr;
++  struct ares_addr host;
+   struct server_state *newserv;
++  char *p, *txtaddr;
+   /* On Windows, there may be more than one nameserver specified in the same
+-   * registry key, so we parse it as a space or comma seperated list.
++   * registry key, so we parse input as a space or comma seperated list.
+    */
+-#ifdef WIN32
+-  char *p = str;
+-  char *begin = str;
+-  int more = 1;
+-  while (more)
+-  {
+-    more = 0;
+-    while (*p && !ISSPACE(*p) && *p != ',')
+-      p++;
+-
+-    if (*p)
++  for (p = str; p;)
+     {
+-      *p = '\0';
+-      more = 1;
+-    }
++      /* Skip whitespace and commas. */
++      while (*p && (ISSPACE(*p) || (*p == ',')))
++        p++;
++      if (!*p)
++        /* No more input, done. */
++        break;
+ 
+-    /* Skip multiple spaces or trailing spaces */
+-    if (!*begin)
+-    {
+-      begin = ++p;
+-      continue;
+-    }
++      /* Pointer to start of IPv4 or IPv6 address part. */
++      txtaddr = p;
+ 
+-    /* This is the part that actually sets the nameserver */
+-    addr.s_addr = inet_addr(begin);
+-    if (addr.s_addr == INADDR_NONE)
+-      continue;
+-    newserv = realloc(*servers, (*nservers + 1) * sizeof(struct server_state));
+-    if (!newserv)
+-      return ARES_ENOMEM;
+-    newserv[*nservers].addr = addr;
+-    *servers = newserv;
+-    (*nservers)++;
++      /* Advance past this address. */
++      while (*p && !ISSPACE(*p) && (*p != ','))
++        p++;
++      if (*p)
++        /* Null terminate this address. */
++        *p++ = '\0';
++      else
++        /* Reached end of input, done when this address is processed. */
++        p = NULL;
++
++      /* Convert textual address to binary format. */
++      if (ares_inet_pton(AF_INET, txtaddr, &host.addrV4) == 1)
++        host.family = AF_INET;
++      else if (ares_inet_pton(AF_INET6, txtaddr, &host.addrV6) == 1)
++        host.family = AF_INET6;
++      else
++        continue;
++
++      /* Resize servers state array. */
++      newserv = realloc(*servers, (*nservers + 1) *
++                        sizeof(struct server_state));
++      if (!newserv)
++        return ARES_ENOMEM;
++
++      /* Store address data. */
++      newserv[*nservers].addr.family = host.family;
++      if (host.family == AF_INET)
++        memcpy(&newserv[*nservers].addr.addrV4, &host.addrV4,
++               sizeof(host.addrV4));
++      else
++        memcpy(&newserv[*nservers].addr.addrV6, &host.addrV6,
++               sizeof(host.addrV6));
++
++      /* Update arguments. */
++      *servers = newserv;
++      *nservers += 1;
++    }
+ 
+-    if (!more)
+-      break;
+-    begin = ++p;
+-  }
+-#else
+-  /* Add a nameserver entry, if this is a valid address. */
+-  addr.s_addr = inet_addr(str);
+-  if (addr.s_addr == INADDR_NONE)
+-    return ARES_SUCCESS;
+-  newserv = realloc(*servers, (*nservers + 1) * sizeof(struct server_state));
+-  if (!newserv)
+-    return ARES_ENOMEM;
+-  newserv[*nservers].addr = addr;
+-  *servers = newserv;
+-  (*nservers)++;
+-#endif
+   return ARES_SUCCESS;
+ }
+ 
+@@ -1580,3 +1603,129 @@ void ares_set_socket_callback(ares_channel channel,
+   channel->sock_create_cb = cb;
+   channel->sock_create_cb_data = data;
+ }
++
++void ares__init_servers_state(ares_channel channel)
++{
++  struct server_state *server;
++  int i;
++
++  for (i = 0; i < channel->nservers; i++)
++    {
++      server = &channel->servers[i];
++      server->udp_socket = ARES_SOCKET_BAD;
++      server->tcp_socket = ARES_SOCKET_BAD;
++      server->tcp_connection_generation = ++channel->tcp_connection_generation;
++      server->tcp_lenbuf_pos = 0;
++      server->tcp_buffer_pos = 0;
++      server->tcp_buffer = NULL;
++      server->tcp_length = 0;
++      server->qhead = NULL;
++      server->qtail = NULL;
++      ares__init_list_head(&server->queries_to_server);
++      server->channel = channel;
++      server->is_broken = 0;
++    }
++}
++
++int ares_get_servers(ares_channel channel,
++                     struct ares_addr_node **servers)
++{
++  struct ares_addr_node *srvr_head = NULL;
++  struct ares_addr_node *srvr_last = NULL;
++  struct ares_addr_node *srvr_curr;
++  int status = ARES_SUCCESS;
++  int i;
++
++  if (!channel)
++    return ARES_ENODATA;
++
++  for (i = 0; i < channel->nservers; i++)
++    {
++      /* Allocate storage for this server node appending it to the list */
++      srvr_curr = ares_malloc_data(ARES_DATATYPE_ADDR_NODE);
++      if (!srvr_curr)
++        {
++          status = ARES_ENOMEM;
++          break;
++        }
++      if (srvr_last)
++        {
++          srvr_last->next = srvr_curr;
++        }
++      else
++        {
++          srvr_head = srvr_curr;
++        }
++      srvr_last = srvr_curr;
++
++      /* Fill this server node data */
++      srvr_curr->family = channel->servers[i].addr.family;
++      if (srvr_curr->family == AF_INET)
++        memcpy(&srvr_curr->addrV4, &channel->servers[i].addr.addrV4,
++               sizeof(srvr_curr->addrV4));
++      else
++        memcpy(&srvr_curr->addrV6, &channel->servers[i].addr.addrV6,
++               sizeof(srvr_curr->addrV6));
++    }
++
++  if (status != ARES_SUCCESS)
++    {
++      if (srvr_head)
++        {
++          ares_free_data(srvr_head);
++          srvr_head = NULL;
++        }
++    }
++
++  *servers = srvr_head;
++
++  return status;
++}
++
++
++int ares_set_servers(ares_channel channel,
++                     struct ares_addr_node *servers)
++{
++  struct ares_addr_node *srvr;
++  int num_srvrs = 0;
++  int i;
++
++  if (ares_library_initialized() != ARES_SUCCESS)
++    return ARES_ENOTINITIALIZED;
++
++  if (!channel)
++    return ARES_ENODATA;
++
++  ares__destroy_servers_state(channel);
++
++  for (srvr = servers; srvr; srvr = srvr->next)
++    {
++      num_srvrs++;
++    }
++
++  if (num_srvrs > 0)
++    {
++      /* Allocate storage for servers state */
++      channel->servers = malloc(num_srvrs * sizeof(struct server_state));
++      if (!channel->servers)
++        {
++          return ARES_ENOMEM;
++        }
++      channel->nservers = num_srvrs;
++      /* Fill servers state address data */
++      for (i = 0, srvr = servers; srvr; i++, srvr = srvr->next)
++        {
++          channel->servers[i].addr.family = srvr->family;
++          if (srvr->family == AF_INET)
++            memcpy(&channel->servers[i].addr.addrV4, &srvr->addrV4,
++                   sizeof(srvr->addrV4));
++          else
++            memcpy(&channel->servers[i].addr.addrV6, &srvr->addrV6,
++                   sizeof(srvr->addrV6));
++        }
++      /* Initialize servers state remaining data */
++      ares__init_servers_state(channel);
++    }
++
++  return ARES_SUCCESS;
++}
+diff --git a/ares_ipv6.h b/ares_ipv6.h
+index 18914d1..eb19f31 100644
+--- a/ares_ipv6.h
++++ b/ares_ipv6.h
+@@ -1,4 +1,4 @@
+-/* $Id: ares_ipv6.h,v 1.9 2009-05-02 02:36:48 yangtse Exp $ */
++/* $Id: ares_ipv6.h,v 1.11 2010-03-06 01:23:09 yangtse Exp $ */
+ 
+ /* Copyright (C) 2005 by Dominick Meglio
+  *
+@@ -22,23 +22,14 @@
+ #define PF_INET6 AF_INET6
+ #endif
+ 
+-#if !defined(HAVE_STRUCT_IN6_ADDR) && !defined(s6_addr)
+-struct in6_addr {
+-  union {
+-    unsigned char _S6_u8[16];
+-  } _S6_un;
+-};
+-#define s6_addr _S6_un._S6_u8
+-#endif
+-
+ #ifndef HAVE_STRUCT_SOCKADDR_IN6
+ struct sockaddr_in6
+ {
+-  unsigned short  sin6_family;
+-  unsigned short  sin6_port;
+-  unsigned long   sin6_flowinfo;
+-  struct in6_addr sin6_addr;
+-  unsigned int    sin6_scope_id;
++  unsigned short       sin6_family;
++  unsigned short       sin6_port;
++  unsigned long        sin6_flowinfo;
++  struct ares_in6_addr sin6_addr;
++  unsigned int         sin6_scope_id;
+ };
+ #endif
+ 
+diff --git a/ares_parse_aaaa_reply.c b/ares_parse_aaaa_reply.c
+index c2329cc..364f430 100644
+--- a/ares_parse_aaaa_reply.c
++++ b/ares_parse_aaaa_reply.c
+@@ -1,4 +1,4 @@
+-/* $Id: ares_parse_aaaa_reply.c,v 1.16 2009-11-23 01:24:17 yangtse Exp $ */
++/* $Id: ares_parse_aaaa_reply.c,v 1.17 2010-03-05 20:01:48 yangtse Exp $ */
+ 
+ /* Copyright 1998 by the Massachusetts Institute of Technology.
+  * Copyright 2005 Dominick Meglio
+@@ -65,7 +65,7 @@ int ares_parse_aaaa_reply(const unsigned char *abuf, int alen,
+   long len;
+   const unsigned char *aptr;
+   char *hostname, *rr_name, *rr_data, **aliases;
+-  struct in6_addr *addrs;
++  struct ares_in6_addr *addrs;
+   struct hostent *hostent;
+   const int max_addr_ttls = (addrttls && naddrttls) ? *naddrttls : 0;
+ 
+@@ -101,7 +101,7 @@ int ares_parse_aaaa_reply(const unsigned char *abuf, int alen,
+   /* Allocate addresses and aliases; ancount gives an upper bound for both. */
+   if (host)
+     {
+-      addrs = malloc(ancount * sizeof(struct in6_addr));
++      addrs = malloc(ancount * sizeof(struct ares_in6_addr));
+       if (!addrs)
+         {
+           free(hostname);
+@@ -143,27 +143,27 @@ int ares_parse_aaaa_reply(const unsigned char *abuf, int alen,
+       aptr += RRFIXEDSZ;
+ 
+       if (rr_class == C_IN && rr_type == T_AAAA
+-          && rr_len == sizeof(struct in6_addr)
++          && rr_len == sizeof(struct ares_in6_addr)
+           && strcasecmp(rr_name, hostname) == 0)
+         {
+           if (addrs)
+             {
+-              if (aptr + sizeof(struct in6_addr) > abuf + alen)
++              if (aptr + sizeof(struct ares_in6_addr) > abuf + alen)
+               {
+                 status = ARES_EBADRESP;
+                 break;
+               }
+-              memcpy(&addrs[naddrs], aptr, sizeof(struct in6_addr));
++              memcpy(&addrs[naddrs], aptr, sizeof(struct ares_in6_addr));
+             }
+           if (naddrs < max_addr_ttls)
+             {
+               struct ares_addr6ttl * const at = &addrttls[naddrs];
+-              if (aptr + sizeof(struct in6_addr) > abuf + alen)
++              if (aptr + sizeof(struct ares_in6_addr) > abuf + alen)
+               {
+                 status = ARES_EBADRESP;
+                 break;
+               }
+-              memcpy(&at->ip6addr, aptr,  sizeof(struct in6_addr));
++              memcpy(&at->ip6addr, aptr,  sizeof(struct ares_in6_addr));
+               at->ttl = rr_ttl;
+             }
+           naddrs++;
+@@ -233,7 +233,7 @@ int ares_parse_aaaa_reply(const unsigned char *abuf, int alen,
+                   hostent->h_name = hostname;
+                   hostent->h_aliases = aliases;
+                   hostent->h_addrtype = AF_INET6;
+-                  hostent->h_length = sizeof(struct in6_addr);
++                  hostent->h_length = sizeof(struct ares_in6_addr);
+                   for (i = 0; i < naddrs; i++)
+                     hostent->h_addr_list[i] = (char *) &addrs[i];
+                   hostent->h_addr_list[naddrs] = NULL;
+diff --git a/ares_private.h b/ares_private.h
+index 4726d7a..1de693a 100644
+--- a/ares_private.h
++++ b/ares_private.h
+@@ -1,10 +1,10 @@
+ #ifndef __ARES_PRIVATE_H
+ #define __ARES_PRIVATE_H
+ 
+-/* $Id: ares_private.h,v 1.50 2009-11-09 12:56:50 yangtse Exp $ */
++/* $Id: ares_private.h,v 1.51 2010-03-05 20:01:48 yangtse Exp $ */
+ 
+ /* Copyright 1998 by the Massachusetts Institute of Technology.
+- * Copyright (C) 2004-2009 by Daniel Stenberg
++ * Copyright (C) 2004-2010 by Daniel Stenberg
+  *
+  * Permission to use, copy, modify, and distribute this
+  * software and its documentation for any purpose and without
+@@ -113,8 +113,8 @@
+ struct ares_addr {
+   int family;
+   union {
+-    struct in_addr  addr4;
+-    struct in6_addr addr6;
++    struct in_addr       addr4;
++    struct ares_in6_addr addr6;
+   } addr;
+ };
+ #define addrV4 addr.addr4
+@@ -137,7 +137,7 @@ struct send_request {
+ };
+ 
+ struct server_state {
+-  struct in_addr addr;
++  struct ares_addr addr;
+   ares_socket_t udp_socket;
+   ares_socket_t tcp_socket;
+ 
+@@ -221,14 +221,14 @@ struct query_server_info {
+ struct apattern {
+   union
+   {
+-    struct in_addr  addr4;
+-    struct in6_addr addr6;
++    struct in_addr       addr4;
++    struct ares_in6_addr addr6;
+   } addr;
+   union
+   {
+-    struct in_addr  addr4;
+-    struct in6_addr addr6;
+-    unsigned short  bits;
++    struct in_addr       addr4;
++    struct ares_in6_addr addr6;
++    unsigned short       bits;
+   } mask;
+   int family;
+   unsigned short type;
+@@ -319,6 +319,8 @@ struct timeval ares__tvnow(void);
+ int ares__expand_name_for_response(const unsigned char *encoded,
+                                    const unsigned char *abuf, int alen,
+                                    char **s, long *enclen);
++void ares__init_servers_state(ares_channel channel);
++void ares__destroy_servers_state(ares_channel channel);
+ #if 0 /* Not used */
+ long ares__tvdiff(struct timeval t1, struct timeval t2);
+ #endif
+diff --git a/ares_process.c b/ares_process.c
+index 6182ccc..ef4060a 100644
+--- a/ares_process.c
++++ b/ares_process.c
+@@ -97,6 +97,7 @@ static int open_tcp_socket(ares_channel channel, struct server_state *server);
+ static int open_udp_socket(ares_channel channel, struct server_state *server);
+ static int same_questions(const unsigned char *qbuf, int qlen,
+                           const unsigned char *abuf, int alen);
++static int same_address(struct sockaddr *sa, struct ares_addr *aa);
+ static void end_query(ares_channel channel, struct query *query, int status,
+                       unsigned char *abuf, int alen);
+ 
+@@ -428,8 +429,11 @@ static void read_udp_packets(ares_channel channel, fd_set *read_fds,
+   ssize_t count;
+   unsigned char buf[PACKETSZ + 1];
+ #ifdef HAVE_RECVFROM
+-  struct sockaddr_in from;
+   ares_socklen_t fromlen;
++  union {
++    struct sockaddr_in  sa4;
++    struct sockaddr_in6 sa6;
++  } from;
+ #endif
+ 
+   if(!read_fds && (read_fd == ARES_SOCKET_BAD))
+@@ -465,7 +469,10 @@ static void read_udp_packets(ares_channel channel, fd_set *read_fds,
+        * packets as we can. */
+       do {
+ #ifdef HAVE_RECVFROM
+-        fromlen = sizeof(from);
++        if (server->addr.family == AF_INET)
++          fromlen = sizeof(from.sa4);
++        else
++          fromlen = sizeof(from.sa6);
+         count = (ssize_t)recvfrom(server->udp_socket, (void *)buf, sizeof(buf),
+                                   0, (struct sockaddr *)&from, &fromlen);
+ #else
+@@ -476,10 +483,10 @@ static void read_udp_packets(ares_channel channel, fd_set *read_fds,
+         else if (count <= 0)
+           handle_error(channel, i, now);
+ #ifdef HAVE_RECVFROM
+-        else if (from.sin_addr.s_addr != server->addr.s_addr)
+-          /* Address response came from did not match the address
+-           * we sent the request to.  Someone may be attempting
+-           * to perform a cache poisoning attack */
++        else if (!same_address((struct sockaddr *)&from, &server->addr))
++          /* The address the response comes from does not match
++           * the address we sent the request to. Someone may be
++           * attempting to perform a cache poisoning attack. */
+           break;
+ #endif
+         else
+@@ -886,10 +893,39 @@ static int open_tcp_socket(ares_channel channel, struct server_state *server)
+ {
+   ares_socket_t s;
+   int opt;
+-  struct sockaddr_in sockin;
++  ares_socklen_t salen;
++  union {
++    struct sockaddr_in  sa4;
++    struct sockaddr_in6 sa6;
++  } saddr;
++  struct sockaddr *sa;
++
++  switch (server->addr.family)
++    {
++      case AF_INET:
++        sa = (void *)&saddr.sa4;
++        salen = sizeof(saddr.sa4);
++        memset(sa, 0, salen);
++        saddr.sa4.sin_family = AF_INET;
++        saddr.sa4.sin_port = (unsigned short)(channel->tcp_port & 0xffff);
++        memcpy(&saddr.sa4.sin_addr, &server->addr.addrV4,
++               sizeof(server->addr.addrV4));
++        break;
++      case AF_INET6:
++        sa = (void *)&saddr.sa6;
++        salen = sizeof(saddr.sa6);
++        memset(sa, 0, salen);
++        saddr.sa6.sin6_family = AF_INET6;
++        saddr.sa6.sin6_port = (unsigned short)(channel->tcp_port & 0xffff);
++        memcpy(&saddr.sa6.sin6_addr, &server->addr.addrV6,
++               sizeof(server->addr.addrV6));
++        break;
++      default:
++        return -1;
++    }
+ 
+   /* Acquire a socket. */
+-  s = socket(AF_INET, SOCK_STREAM, 0);
++  s = socket(server->addr.family, SOCK_STREAM, 0);
+   if (s == ARES_SOCKET_BAD)
+     return -1;
+ 
+@@ -917,11 +953,7 @@ static int open_tcp_socket(ares_channel channel, struct server_state *server)
+ #endif
+ 
+   /* Connect to the server. */
+-  memset(&sockin, 0, sizeof(sockin));
+-  sockin.sin_family = AF_INET;
+-  sockin.sin_addr = server->addr;
+-  sockin.sin_port = (unsigned short)(channel->tcp_port & 0xffff);
+-  if (connect(s, (struct sockaddr *) &sockin, sizeof(sockin)) == -1)
++  if (connect(s, sa, salen) == -1)
+     {
+       int err = SOCKERRNO;
+ 
+@@ -953,10 +985,39 @@ static int open_tcp_socket(ares_channel channel, struct server_state *server)
+ static int open_udp_socket(ares_channel channel, struct server_state *server)
+ {
+   ares_socket_t s;
+-  struct sockaddr_in sockin;
++  ares_socklen_t salen;
++  union {
++    struct sockaddr_in  sa4;
++    struct sockaddr_in6 sa6;
++  } saddr;
++  struct sockaddr *sa;
++
++  switch (server->addr.family)
++    {
++      case AF_INET:
++        sa = (void *)&saddr.sa4;
++        salen = sizeof(saddr.sa4);
++        memset(sa, 0, salen);
++        saddr.sa4.sin_family = AF_INET;
++        saddr.sa4.sin_port = (unsigned short)(channel->udp_port & 0xffff);
++        memcpy(&saddr.sa4.sin_addr, &server->addr.addrV4,
++               sizeof(server->addr.addrV4));
++        break;
++      case AF_INET6:
++        sa = (void *)&saddr.sa6;
++        salen = sizeof(saddr.sa6);
++        memset(sa, 0, salen);
++        saddr.sa6.sin6_family = AF_INET6;
++        saddr.sa6.sin6_port = (unsigned short)(channel->udp_port & 0xffff);
++        memcpy(&saddr.sa6.sin6_addr, &server->addr.addrV6,
++               sizeof(server->addr.addrV6));
++        break;
++      default:
++        return -1;
++    }
+ 
+   /* Acquire a socket. */
+-  s = socket(AF_INET, SOCK_DGRAM, 0);
++  s = socket(server->addr.family, SOCK_DGRAM, 0);
+   if (s == ARES_SOCKET_BAD)
+     return -1;
+ 
+@@ -968,11 +1029,7 @@ static int open_udp_socket(ares_channel channel, struct server_state *server)
+     }
+ 
+   /* Connect to the server. */
+-  memset(&sockin, 0, sizeof(sockin));
+-  sockin.sin_family = AF_INET;
+-  sockin.sin_addr = server->addr;
+-  sockin.sin_port = (unsigned short)(channel->udp_port & 0xffff);
+-  if (connect(s, (struct sockaddr *) &sockin, sizeof(sockin)) == -1)
++  if (connect(s, sa, salen) == -1)
+     {
+       int err = SOCKERRNO;
+ 
+@@ -1079,6 +1136,34 @@ static int same_questions(const unsigned char *qbuf, int qlen,
+   return 1;
+ }
+ 
++static int same_address(struct sockaddr *sa, struct ares_addr *aa)
++{
++  void *addr1;
++  void *addr2;
++
++  if (sa->sa_family == aa->family)
++    {
++      switch (aa->family)
++        {
++          case AF_INET:
++            addr1 = &aa->addrV4;
++            addr2 = &((struct sockaddr_in *)sa)->sin_addr;
++            if (memcmp(addr1, addr2, sizeof(aa->addrV4)) == 0)
++              return 1; /* match */
++            break;
++          case AF_INET6:
++            addr1 = &aa->addrV6;
++            addr2 = &((struct sockaddr_in6 *)sa)->sin6_addr;
++            if (memcmp(addr1, addr2, sizeof(aa->addrV6)) == 0)
++              return 1; /* match */
++            break;
++          default:
++            break;
++        }
++    }
++  return 0; /* different */
++}
++
+ static void end_query (ares_channel channel, struct query *query, int status,
+                        unsigned char *abuf, int alen)
+ {
+diff --git a/ares_save_options.3 b/ares_save_options.3
+index 268327c..8ed8925 100644
+--- a/ares_save_options.3
++++ b/ares_save_options.3
+@@ -1,4 +1,4 @@
+-.\" $Id: ares_save_options.3,v 1.3 2009-11-23 00:57:51 yangtse Exp $
++.\" $Id: ares_save_options.3,v 1.4 2010-03-05 20:01:48 yangtse Exp $
+ .\"
+ .\" Copyright 1998 by the Massachusetts Institute of Technology.
+ .\"
+@@ -14,7 +14,7 @@
+ .\" this software for any purpose.  It is provided "as is"
+ .\" without express or implied warranty.
+ .\"
+-.TH ARES_SAVE_OPTIONS 3 "1 June 2007"
++.TH ARES_SAVE_OPTIONS 3 "5 March 2010"
+ .SH NAME
+ ares_save_options \- Save configuration values obtained from initialized ares_channel
+ .SH SYNOPSIS
+@@ -52,13 +52,20 @@ The channel data identified by
+ were invalid.
+ .SH NOTE
+ Since c-ares 1.6.0 the ares_options struct has been "locked" meaning that it
+-won't be extended to cover new funtions. This function will remain
++won't be extended to cover new functions. This function will remain
+ functioning, but it can only return config data that can be represented in
+ this config struct, which may no longer be the complete set of config
+ options. \fBares_dup(3)\fP will not have that restriction.
++
++The ares_options struct can not handle potential IPv6 name servers the
++ares_channel might be configured to use. Function \fBares_save_options(3)\fP
++will only return IPv4 servers if any. In order to retrieve all name servers
++an ares_channel might be using, function \fBares_get_servers(3)\fP must be
++used instead.
+ .SH SEE ALSO
+ .BR ares_destroy_options (3),
+ .BR ares_init_options (3),
++.BR ares_get_servers (3),
+ .BR ares_dup (3)
+ .SH AVAILABILITY
+ ares_save_options(3) was added in c-ares 1.4.0
+diff --git a/inet_net_pton.c b/inet_net_pton.c
+index de09ace..f4a0812 100644
+--- a/inet_net_pton.c
++++ b/inet_net_pton.c
+@@ -1,4 +1,4 @@
+-/* $Id: inet_net_pton.c,v 1.17 2009-11-02 11:55:54 yangtse Exp $ */
++/* $Id: inet_net_pton.c,v 1.18 2010-03-05 20:01:48 yangtse Exp $ */
+ 
+ /*
+  * Copyright (c) 2004 by Internet Systems Consortium, Inc. ("ISC")
+@@ -43,6 +43,7 @@
+ #include <string.h>
+ #include <stdlib.h>
+ 
++#include "ares.h"
+ #include "ares_ipv6.h"
+ #include "inet_net_pton.h"
+ 
+@@ -432,7 +433,7 @@ int ares_inet_pton(int af, const char *src, void *dst)
+   if (af == AF_INET)
+     size = sizeof(struct in_addr);
+   else if (af == AF_INET6)
+-    size = sizeof(struct in6_addr);
++    size = sizeof(struct ares_in6_addr);
+   else
+   {
+     SET_ERRNO(EAFNOSUPPORT);
+diff --git a/inet_ntop.c b/inet_ntop.c
+index 5b0d097..31b9ab1 100644
+--- a/inet_ntop.c
++++ b/inet_ntop.c
+@@ -1,4 +1,4 @@
+-/* $Id: inet_ntop.c,v 1.12 2009-11-02 11:55:54 yangtse Exp $ */
++/* $Id: inet_ntop.c,v 1.13 2010-03-05 20:01:48 yangtse Exp $ */
+ 
+ /* Copyright (c) 1996 by Internet Software Consortium.
+  *
+@@ -42,6 +42,7 @@
+ #include <string.h>
+ #include <stdlib.h>
+ 
++#include "ares.h"
+ #include "ares_ipv6.h"
+ #include "inet_ntop.h"
+ 
+diff --git a/vc/cares/vc6cares.dsp b/vc/cares/vc6cares.dsp
+index b7c50c6..583a55c 100644
+--- a/vc/cares/vc6cares.dsp
++++ b/vc/cares/vc6cares.dsp
+@@ -226,6 +226,10 @@ SOURCE=..\..\ares_mkquery.c
+ # End Source File
+ # Begin Source File
+ 
++SOURCE=..\..\ares_options.c
++# End Source File
++# Begin Source File
++
+ SOURCE=..\..\ares_parse_a_reply.c
+ # End Source File
+ # Begin Source File
+-- 
+1.6.6.1
+
